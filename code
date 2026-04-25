@@ -1,1 +1,160 @@
+import tkinter as tk
+from tkinter import ttk, messagebox
+import cv2
+import numpy as np
+from PIL import Image, ImageTk
+import os, threading, time, pickle
+import torch
+from facenet_pytorch import MTCNN, InceptionResnetV1
+from scipy.spatial.distance import cosine
+
+# Initialize models
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+mtcnn = MTCNN(image_size=160, margin=0, min_face_size=20,
+              thresholds=[0.6,0.7,0.7], factor=0.709,
+              post_process=False, device=device)
+resnet = InceptionResnetV1(pretrained='vggface2').eval().to(device)
+
+class CameraHandler:
+    def __init__(self, index=0):
+        self.cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+        self.lock = threading.Lock()
+        self.current_frame = None
+        self.is_running = False
+        self.thread = None
+        self.haar = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+        self.face_boxes = []
+
+    def start(self):
+        if not self.cap.isOpened():
+            raise RuntimeError("Camera not available")
+        self.is_running = True
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.is_running = False
+        if self.cap: self.cap.release()
+
+    def _run(self):
+        while self.is_running:
+            ret, frame = self.cap.read()
+            if not ret: continue
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = self.haar.detectMultiScale(gray, 1.1, 5, minSize=(80,80))
+            with self.lock:
+                self.current_frame = frame.copy()
+                self.face_boxes = [[x,y,x+w,y+h] for (x,y,w,h) in faces]
+
+    def get_frame(self):
+        with self.lock:
+            return None if self.current_frame is None else self.current_frame.copy()
+
+    def get_boxes(self):
+        with self.lock:
+            return list(self.face_boxes)
+
+class IdentitySystem:
+    def get_embeddings(self, frame, boxes):
+        embeddings = []
+        for (x1,y1,x2,y2) in boxes:
+            crop = frame[y1:y2, x1:x2]
+            img = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+            tensor = mtcnn(img)
+            if tensor is not None:
+                with torch.no_grad():
+                    emb = resnet(tensor.unsqueeze(0).to(device))
+                embeddings.append(emb.cpu().numpy()[0])
+        return embeddings
+
+    def recognize(self, embeddings, user_db):
+        results = []
+        for i, emb in enumerate(embeddings, start=1):
+            best_match, best_score = "Unknown", 0.0
+            for uid, data in user_db.items():
+                try:
+                    reg_emb = np.load(os.path.join("face_embeddings", f"{uid}.npy"))
+                    sim = 1 - cosine(emb, reg_emb)
+                    if sim > best_score:
+                        best_score, best_match = sim, data["name"]
+                except: continue
+            status = "Known" if best_score >= 0.7 else "Unknown"
+            results.append({"Face ID": i, "Name": best_match if status=="Known" else "Unknown",
+                            "Confidence (%)": round(best_score*100,2), "Status": status})
+        return results
+
+class FaceDialog(tk.Toplevel):
+    def __init__(self, parent, mode, user_db):
+        super().__init__(parent)
+        self.mode = mode
+        self.user_db = user_db
+        self.camera = CameraHandler()
+        self.system = IdentitySystem()
+        self.title("Face Authentication")
+        self.geometry("900x700")
+        self.create_widgets()
+        self.camera.start()
+        self.update_loop()
+
+    def create_widgets(self):
+        ttk.Label(self, text="Camera Preview", font=('Helvetica',14,'bold')).pack(pady=5)
+        self.cam_label = tk.Label(self, bg="black")
+        self.cam_label.pack(pady=10)
+
+        # Results table
+        self.results_table = ttk.Treeview(self, columns=("Name","Confidence","Status"), show="headings")
+        for col in ("Name","Confidence","Status"):
+            self.results_table.heading(col, text=col)
+        self.results_table.pack(fill="x", pady=10)
+
+        ttk.Button(self, text="Close", command=self.close).pack(pady=5)
+
+    def update_loop(self):
+        frame = self.camera.get_frame()
+        boxes = self.camera.get_boxes()
+        if frame is not None:
+            for (x1,y1,x2,y2) in boxes:
+                cv2.rectangle(frame,(x1,y1),(x2,y2),(0,255,0),2)
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            pil = Image.fromarray(rgb)
+            pil.thumbnail((800,600))
+            tkimg = ImageTk.PhotoImage(pil)
+            self.cam_label.configure(image=tkimg)
+            self.cam_label.image = tkimg
+
+            # Recognition
+            embeddings = self.system.get_embeddings(frame, boxes)
+            results = self.system.recognize(embeddings, self.user_db)
+
+            # Update table
+            for row in self.results_table.get_children():
+                self.results_table.delete(row)
+            for r in results:
+                self.results_table.insert("", "end", values=(r["Name"], f"{r['Confidence (%)']}%", r["Status"]))
+
+        self.after(50, self.update_loop)
+
+    def close(self):
+        self.camera.stop()
+        self.destroy()
+
+class MainApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Multi-Face Authentication")
+        self.geometry("400x300")
+        self.user_db = {}
+        self.load_db()
+        ttk.Label(self, text="Choose Mode", font=('Helvetica',16,'bold')).pack(pady=20)
+        ttk.Button(self, text="Register", command=lambda: FaceDialog(self,"register",self.user_db)).pack(pady=10)
+        ttk.Button(self, text="Verify", command=lambda: FaceDialog(self,"verify",self.user_db)).pack(pady=10)
+
+    def load_db(self):
+        if os.path.exists("user_database.pkl"):
+            with open("user_database.pkl","rb") as f:
+                self.user_db = pickle.load(f)
+
+if __name__=="__main__":
+    app = MainApp()
+    app.mainloop()
 
